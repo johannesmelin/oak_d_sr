@@ -29,6 +29,16 @@ DEFAULT_MODEL = Path(
     "/home/johannes/projects/oak_camera/training_runs/"
     "knopp_yolo_seg_640_e30/weights/best.pt"
 )
+HsvRange = tuple[tuple[int, int, int], tuple[int, int, int]]
+CAM_TO_GRID_R = np.array(
+    [
+        [0.999385368, -0.019589753, -0.029071071],
+        [0.011272280, -0.605663194, 0.795641271],
+        [-0.033193694, -0.795479941, -0.605070113],
+    ],
+    dtype=np.float64,
+)
+CAM_TO_GRID_T = np.array([15.726901, -7.512921, 311.320733], dtype=np.float64)
 
 VIEWER_PAGE = """<!doctype html>
 <html lang="en">
@@ -109,6 +119,7 @@ class SegSpatialDetection:
     polygon: np.ndarray | None
     center: tuple[int, int]
     xyz_mm: tuple[float, float, float] | None
+    grid_xyz_mm: tuple[float, float, float] | None
     source: str
     support_pixels: int
     depth_z_mm: float | None
@@ -380,6 +391,92 @@ def parse_classes(value: str | None) -> set[str]:
     return {part.strip() for part in value.split(",") if part.strip()}
 
 
+def parse_hsv(value: str) -> tuple[int, int, int]:
+    parts = [int(part.strip()) for part in value.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("HSV values must be formatted as H,S,V")
+    h, s, v = parts
+    if not (0 <= h <= 179 and 0 <= s <= 255 and 0 <= v <= 255):
+        raise argparse.ArgumentTypeError("HSV limits are H=0..179, S=0..255, V=0..255")
+    return h, s, v
+
+
+def hsv_config_from_file(path: Path) -> tuple[list[HsvRange], int | None, int | None]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    open_kernel = payload.get("open_kernel")
+    close_kernel = payload.get("close_kernel")
+    if "ranges" in payload:
+        return (
+            [(tuple(item["low"]), tuple(item["high"])) for item in payload["ranges"]],
+            None if open_kernel is None else int(open_kernel),
+            None if close_kernel is None else int(close_kernel),
+        )
+
+    h_low = int(payload["h_low"])
+    h_high = int(payload["h_high"])
+    s_low = int(payload["s_low"])
+    s_high = int(payload["s_high"])
+    v_low = int(payload["v_low"])
+    v_high = int(payload["v_high"])
+    if bool(payload.get("wrap_hue")):
+        ranges = [
+            ((h_low, s_low, v_low), (179, s_high, v_high)),
+            ((0, s_low, v_low), (h_high, s_high, v_high)),
+        ]
+    else:
+        ranges = [((h_low, s_low, v_low), (h_high, s_high, v_high))]
+    return (
+        ranges,
+        None if open_kernel is None else int(open_kernel),
+        None if close_kernel is None else int(close_kernel),
+    )
+
+
+def resolve_hsv_ranges(args: argparse.Namespace) -> list[HsvRange]:
+    ranges: list[HsvRange] = []
+    if args.hsv_config:
+        config_ranges, open_kernel, close_kernel = hsv_config_from_file(args.hsv_config)
+        ranges.extend(config_ranges)
+        if open_kernel is not None:
+            args.hsv_open_kernel = open_kernel
+        if close_kernel is not None:
+            args.hsv_close_kernel = close_kernel
+    if args.hsv_low or args.hsv_high:
+        if not (args.hsv_low and args.hsv_high):
+            raise ValueError("Use both --hsv-low and --hsv-high.")
+        ranges.append((args.hsv_low, args.hsv_high))
+    return ranges
+
+
+def odd_kernel_size(value: int) -> int:
+    if value <= 1:
+        return 0
+    return value if value % 2 == 1 else value + 1
+
+
+def hsv_mask(
+    frame: np.ndarray,
+    ranges: list[HsvRange],
+    open_kernel: int,
+    close_kernel: int,
+) -> np.ndarray:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for low, high in ranges:
+        mask |= cv2.inRange(hsv, np.array(low, dtype=np.uint8), np.array(high, dtype=np.uint8))
+
+    open_size = odd_kernel_size(open_kernel)
+    if open_size:
+        kernel = np.ones((open_size, open_size), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    close_size = odd_kernel_size(close_kernel)
+    if close_size:
+        kernel = np.ones((close_size, close_size), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+
 def class_label(names: dict[int, str] | list[str], class_id: int) -> str:
     if isinstance(names, dict):
         return names.get(class_id, str(class_id))
@@ -401,6 +498,27 @@ def xyz_from_pixel(
     x_mm = (u - cx) * z_mm / fx
     y_mm = (v - cy) * z_mm / fy
     return x_mm, y_mm, z_mm
+
+
+def cam_to_grid(xyz_mm: tuple[float, float, float]) -> tuple[float, float, float]:
+    grid = CAM_TO_GRID_R @ np.asarray(xyz_mm, dtype=np.float64) + CAM_TO_GRID_T
+    return tuple(float(value) for value in grid)
+
+
+def apply_grid_transform(
+    detections: list[SegSpatialDetection],
+    enabled: bool,
+) -> list[SegSpatialDetection]:
+    if not enabled:
+        return detections
+
+    transformed = []
+    for detection in detections:
+        if detection.xyz_mm is None:
+            transformed.append(replace(detection, grid_xyz_mm=None))
+        else:
+            transformed.append(replace(detection, grid_xyz_mm=cam_to_grid(detection.xyz_mm)))
+    return transformed
 
 
 def scaled_polygon(points: np.ndarray, scale: float) -> np.ndarray:
@@ -427,12 +545,25 @@ def polygon_mask(
 
 
 def depth_estimate_for_mask(
+    frame: np.ndarray,
     depth_frame: np.ndarray,
     points: np.ndarray,
     intrinsics: np.ndarray,
     args: argparse.Namespace,
 ) -> PositionEstimate | None:
     mask = polygon_mask(depth_frame.shape[:2], points, args.mask_scale, args.mask_erode)
+    source = "seg-mask-depth"
+    if args.depth_mask == "hsv":
+        color_mask = hsv_mask(frame, args.hsv_ranges, args.hsv_open_kernel, args.hsv_close_kernel)
+        hsv_masked = cv2.bitwise_and(mask, color_mask)
+        if np.count_nonzero(hsv_masked) >= args.min_depth_pixels:
+            mask = hsv_masked
+            source = "seg+hsv-depth"
+        elif args.hsv_fallback:
+            source = "seg-depth-fallback"
+        else:
+            return None
+
     valid = (
         (mask > 0)
         & (depth_frame >= args.lower_mm)
@@ -440,6 +571,16 @@ def depth_estimate_for_mask(
         & np.isfinite(depth_frame)
     )
     values = depth_frame[valid]
+    if values.size < args.min_depth_pixels and args.depth_mask == "hsv" and args.hsv_fallback:
+        mask = polygon_mask(depth_frame.shape[:2], points, args.mask_scale, args.mask_erode)
+        source = "seg-depth-fallback"
+        valid = (
+            (mask > 0)
+            & (depth_frame >= args.lower_mm)
+            & (depth_frame <= args.upper_mm)
+            & np.isfinite(depth_frame)
+        )
+        values = depth_frame[valid]
     if values.size < args.min_depth_pixels:
         return None
 
@@ -458,7 +599,7 @@ def depth_estimate_for_mask(
     return PositionEstimate(
         xyz_mm=xyz_from_pixel(pixel, z_mm, intrinsics),
         pixel=pixel,
-        source="seg-mask-depth",
+        source=source,
         support_pixels=int(selected_values.size),
         z_mm=z_mm,
     )
@@ -522,7 +663,7 @@ def run_seg_localizer(
         if polygon is not None and len(polygon) >= 3:
             points = np.asarray(polygon, dtype=np.float32)
 
-        depth = None if points is None else depth_estimate_for_mask(depth_frame, points, intrinsics, args)
+        depth = None if points is None else depth_estimate_for_mask(frame, depth_frame, points, intrinsics, args)
         if args.require_position and depth is None:
             continue
 
@@ -536,6 +677,7 @@ def run_seg_localizer(
                 polygon=None if points is None else np.round(points).astype(np.int32),
                 center=center,
                 xyz_mm=None if depth is None else depth.xyz_mm,
+                grid_xyz_mm=None,
                 source="none" if depth is None else depth.source,
                 support_pixels=0 if depth is None else depth.support_pixels,
                 depth_z_mm=None if depth is None else depth.z_mm,
@@ -544,6 +686,47 @@ def run_seg_localizer(
 
     detections.sort(key=lambda detection: detection.confidence, reverse=True)
     return detections
+
+
+def draw_label_box(
+    frame: np.ndarray,
+    anchor: tuple[int, int],
+    lines: list[str],
+    color: tuple[int, int, int],
+) -> None:
+    if not lines:
+        return
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.48
+    thickness = 1
+    line_height = 18
+    sizes = [cv2.getTextSize(line, font, scale, thickness)[0] for line in lines]
+    text_width = max(size[0] for size in sizes)
+    box_width = min(frame.shape[1], text_width + 10)
+    box_height = line_height * len(lines) + 8
+
+    x, y = anchor
+    x = min(max(0, x), max(0, frame.shape[1] - box_width))
+    y = max(box_height + 2, y)
+    if y > frame.shape[0] - 2:
+        y = frame.shape[0] - 2
+    top = max(0, y - box_height)
+    bottom = min(frame.shape[0], y + 2)
+    right = min(frame.shape[1], x + box_width)
+
+    cv2.rectangle(frame, (x, top), (right, bottom), (15, 20, 24), -1)
+    for index, line in enumerate(lines):
+        cv2.putText(
+            frame,
+            line,
+            (x + 5, top + 17 + line_height * index),
+            font,
+            scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
 
 
 def draw_detections(frame: np.ndarray, detections: list[SegSpatialDetection], show_boxes: bool) -> None:
@@ -560,32 +743,18 @@ def draw_detections(frame: np.ndarray, detections: list[SegSpatialDetection], sh
 
         cv2.circle(frame, detection.center, 4, (0, 0, 255), -1)
         if detection.xyz_mm is None:
-            text = f"{index}: {detection.label} {detection.confidence:.2f} no position"
+            lines = [f"{index}: {detection.label} {detection.confidence:.2f} no position"]
         else:
             x_mm, y_mm, z_mm = detection.xyz_mm
-            text = (
-                f"{index}: {detection.label} {detection.confidence:.2f} "
-                f"x={x_mm:.0f} y={y_mm:.0f} z={z_mm:.0f}mm "
-                f"{detection.source} px={detection.support_pixels}"
-            )
+            lines = [
+                f"{index}: {detection.label} {detection.confidence:.2f} {detection.source} px={detection.support_pixels}",
+                f"cam  x={x_mm:.0f} y={y_mm:.0f} z={z_mm:.0f} mm",
+            ]
+            if detection.grid_xyz_mm is not None:
+                gx_mm, gy_mm, gz_mm = detection.grid_xyz_mm
+                lines.append(f"grid x={gx_mm:.0f} y={gy_mm:.0f} z={gz_mm:.0f} mm")
 
-        text_size, baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        text_x = min(x0, max(0, frame.shape[1] - text_size[0] - 8))
-        text_y = max(20, y0 - 8)
-        box_top = max(0, text_y - text_size[1] - baseline - 4)
-        box_bottom = min(frame.shape[0], text_y + baseline + 4)
-        box_right = min(frame.shape[1], text_x + text_size[0] + 8)
-        cv2.rectangle(frame, (text_x, box_top), (box_right, box_bottom), (15, 20, 24), -1)
-        cv2.putText(
-            frame,
-            text,
-            (text_x + 4, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
+        draw_label_box(frame, (x0, max(20, y0 - 8)), lines, color)
 
     if detections:
         cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
@@ -616,11 +785,17 @@ def print_detections(frame_number: int, detections: list[SegSpatialDetection]) -
             parts.append(f"#{index} {detection.label} conf={detection.confidence:.2f} no-position")
             continue
         x_mm, y_mm, z_mm = detection.xyz_mm
-        parts.append(
+        text = (
             f"#{index} {detection.label} conf={detection.confidence:.2f} "
-            f"x={x_mm:7.1f} y={y_mm:7.1f} z={z_mm:7.1f} "
+            f"cam=({x_mm:7.1f},{y_mm:7.1f},{z_mm:7.1f}) "
+        )
+        if detection.grid_xyz_mm is not None:
+            gx_mm, gy_mm, gz_mm = detection.grid_xyz_mm
+            text += f"grid=({gx_mm:7.1f},{gy_mm:7.1f},{gz_mm:7.1f}) "
+        text += (
             f"source={detection.source} pixels={detection.support_pixels}"
         )
+        parts.append(text)
     print(f"{frame_number:05d}  " + "  ".join(parts), flush=True)
 
 
@@ -645,6 +820,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-depth-pixels", type=int, default=1)
     parser.add_argument("--depth-percentile", type=float, default=20.0)
     parser.add_argument("--depth-band-mm", type=float, default=30.0)
+    parser.add_argument(
+        "--depth-mask",
+        choices=("segmentation", "hsv"),
+        default="segmentation",
+        help="Use only YOLO segmentation pixels, or YOLO pixels that also match HSV.",
+    )
+    parser.add_argument("--hsv-config", type=Path)
+    parser.add_argument("--hsv-low", type=parse_hsv, help="HSV lower bound as H,S,V")
+    parser.add_argument("--hsv-high", type=parse_hsv, help="HSV upper bound as H,S,V")
+    parser.add_argument("--hsv-open-kernel", type=int, default=0)
+    parser.add_argument("--hsv-close-kernel", type=int, default=2)
+    parser.add_argument(
+        "--no-hsv-fallback",
+        dest="hsv_fallback",
+        action="store_false",
+        help="Do not fall back to the full segmentation mask if HSV gives too few depth pixels.",
+    )
+    parser.set_defaults(hsv_fallback=True)
     parser.add_argument("--mask-scale", type=float, default=0.8)
     parser.add_argument("--mask-erode", type=int, default=0)
     parser.add_argument("--smooth-window", type=int, default=1)
@@ -660,6 +853,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jpeg-quality", type=int, default=85)
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--show-boxes", action="store_true")
+    parser.add_argument(
+        "--no-grid-transform",
+        dest="grid_transform",
+        action="store_false",
+        help="Hide calibrated grid coordinates and show only camera coordinates.",
+    )
+    parser.set_defaults(grid_transform=True)
     return parser.parse_args()
 
 
@@ -690,6 +890,14 @@ def main() -> int:
         raise SystemExit("--depth-percentile must be between 0 and 100")
     if args.depth_band_mm < 0:
         raise SystemExit("--depth-band-mm must be >= 0")
+    try:
+        args.hsv_ranges = resolve_hsv_ranges(args)
+    except (KeyError, OSError, ValueError) as exc:
+        raise SystemExit(f"Could not read HSV settings: {exc}") from exc
+    if args.depth_mask == "hsv" and not args.hsv_ranges:
+        raise SystemExit("Use --hsv-config or --hsv-low/--hsv-high with --depth-mask hsv")
+    if args.hsv_open_kernel < 0 or args.hsv_close_kernel < 0:
+        raise SystemExit("--hsv-open-kernel and --hsv-close-kernel must be >= 0")
     if not 0 < args.mask_scale <= 1:
         raise SystemExit("--mask-scale must be > 0 and <= 1")
     if args.mask_erode < 0:
@@ -753,6 +961,13 @@ def main() -> int:
             print(f"Stereo: CAM_B -> CAM_C, depth aligned to {left_label}")
             print(f"Image: {args.width}x{args.height} at {args.fps} FPS, rotation={args.camera_rotation}")
             print(f"Depth range: {args.lower_mm}-{args.upper_mm} mm")
+            print(f"Depth mask: {args.depth_mask}")
+            if args.depth_mask == "hsv":
+                print(f"Depth HSV ranges: {args.hsv_ranges}")
+                print(
+                    f"Depth HSV morphology: open={args.hsv_open_kernel}, "
+                    f"close={args.hsv_close_kernel}, fallback={args.hsv_fallback}"
+                )
             if viewer is not None:
                 print(f"Open viewer: {viewer.url}")
 
@@ -766,6 +981,7 @@ def main() -> int:
                 frame_number += 1
                 detections = run_seg_localizer(model, frame, depth_frame, intrinsics, args)
                 detections = smoother.update(detections)
+                detections = apply_grid_transform(detections, args.grid_transform)
 
                 now = time.monotonic()
                 if now - last_print >= args.print_every:

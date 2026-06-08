@@ -132,7 +132,65 @@ Programmet gor foljande:
 5. Kor YOLO-segmenteringsmodellen pa kamerabilden.
 6. Anvander segmenteringsmasken som depth-ROI.
 7. Beraknar `z` som median av de framsta giltiga depth-pixlarna i masken.
-8. Raknar om maskens depth-pixel till `x,y,z` med kamerans intrinsics.
+8. Raknar om maskens depth-pixel till `cam x,y,z` med kamerans intrinsics.
+9. Raknar om `cam` till kalibrerade `grid`-koordinater med en rigid
+   transformation.
+
+Kalibreringstransformen ar:
+
+```text
+grid = R @ cam + t
+
+R =
+[[ 0.999385, -0.019590, -0.029071],
+ [ 0.011272, -0.605663,  0.795641],
+ [-0.033194, -0.795480, -0.605070]]
+
+t = [15.726901, -7.512921, 311.320733]
+```
+
+I webblasaren visas bade `cam` och `grid` vid varje detektion. Om bara
+kamerakoordinater ska visas kan grid-transformen stangas av med:
+
+```bash
+--no-grid-transform
+```
+
+Depth-ROI kan ocksa kombineras med HSV-filter. Da anvands bara pixlar som bade
+ligger i YOLO-segmenteringsmasken och matchar objektets HSV-farg. Syftet ar att
+minska risken att depth tas fran bakgrund eller skymmande detaljer nar objektet
+bara delvis syns.
+
+Exempel med HSV-varden direkt i kommandot:
+
+```bash
+/home/johannes/projects/oak_camera/.venv/bin/python \
+  scripts/oakdsr_yolo_seg_localizer.py --web-host 0.0.0.0 \
+  --width 1280 --height 800 \
+  --stereo-width 1280 --stereo-height 800 \
+  --fps 2 --camera-rotation 180 \
+  --viewer-interval-ms 1000 --viewer-scale 0.75 \
+  --depth-mask hsv --hsv-low 62,35,35 --hsv-high 158,255,255 \
+  --hsv-open-kernel 0 --hsv-close-kernel 2
+```
+
+Exempel med sparad HSV-konfiguration fran `oak_camera`:
+
+```bash
+/home/johannes/projects/oak_camera/.venv/bin/python \
+  scripts/oakdsr_yolo_seg_localizer.py --web-host 0.0.0.0 \
+  --width 1280 --height 800 \
+  --stereo-width 1280 --stereo-height 800 \
+  --fps 2 --camera-rotation 180 \
+  --viewer-interval-ms 1000 --viewer-scale 0.75 \
+  --depth-mask hsv \
+  --hsv-config /home/johannes/projects/oak_camera/configs/hsv_filter.json
+```
+
+Om HSV-masken ger for fa giltiga depth-pixlar faller scriptet som standard
+tillbaka till vanlig segmenteringsmask. Det syns i terminalen som
+`source=seg-depth-fallback`. Med `--no-hsv-fallback` kan fallback stangas av
+for renare felsokning.
 
 Viktiga parametrar:
 
@@ -148,6 +206,14 @@ Viktiga parametrar:
 - `--depth-percentile`: valjer narmre depth-varden i masken. Standard `20`.
 - `--depth-band-mm`: bredd runt vald percentile som anvands for median. Standard
   `30`.
+- `--depth-mask`: `segmentation` eller `hsv`. Standard `segmentation`.
+- `--hsv-config`: JSON-fil med sparade HSV-varden.
+- `--hsv-low`, `--hsv-high`: HSV-granser direkt i kommandot, format `H,S,V`.
+- `--hsv-open-kernel`, `--hsv-close-kernel`: morfologi pa HSV-masken.
+- `--no-hsv-fallback`: kraver HSV-depth och faller inte tillbaka till
+  segmenteringsmask.
 - `--smooth-window`: medianutjamning av `x,y,z`. Standard `1`.
 - `--viewer-interval-ms`: hur ofta browserbilden uppdateras. Standard
   `1000`.
+- `--no-grid-transform`: visar bara `cam` och hoppar over kalibrerad
+  `grid`-koordinat.
