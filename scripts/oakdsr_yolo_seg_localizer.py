@@ -32,13 +32,13 @@ DEFAULT_MODEL = Path(
 HsvRange = tuple[tuple[int, int, int], tuple[int, int, int]]
 CAM_TO_GRID_R = np.array(
     [
-        [0.999385368, -0.019589753, -0.029071071],
-        [0.011272280, -0.605663194, 0.795641271],
-        [-0.033193694, -0.795479941, -0.605070113],
+        [0.999739296, -0.017369757, 0.014819986],
+        [-0.022243652, -0.594407549, 0.803856260],
+        [-0.005153677, -0.803976342, -0.594638951],
     ],
     dtype=np.float64,
 )
-CAM_TO_GRID_T = np.array([15.726901, -7.512921, 311.320733], dtype=np.float64)
+CAM_TO_GRID_T = np.array([10.975328, -4.674079, 317.735563], dtype=np.float64)
 
 VIEWER_PAGE = """<!doctype html>
 <html lang="en">
@@ -729,6 +729,83 @@ def draw_label_box(
         )
 
 
+def draw_number_marker(frame: np.ndarray, center: tuple[int, int], index: int) -> None:
+    label = str(index)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.62
+    thickness = 2
+    text_size, baseline = cv2.getTextSize(label, font, scale, thickness)
+    padding_x = 8
+    padding_y = 5
+    width = text_size[0] + padding_x * 2
+    height = text_size[1] + baseline + padding_y * 2
+
+    x = int(center[0] + 8)
+    y = int(center[1] - height - 8)
+    x = min(max(0, x), max(0, frame.shape[1] - width))
+    y = min(max(34, y), max(34, frame.shape[0] - height))
+
+    cv2.rectangle(frame, (x, y), (x + width, y + height), (0, 0, 220), -1)
+    cv2.rectangle(frame, (x, y), (x + width, y + height), (255, 255, 255), 1)
+    cv2.putText(
+        frame,
+        label,
+        (x + padding_x, y + padding_y + text_size[1]),
+        font,
+        scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def draw_coordinate_list(frame: np.ndarray, detections: list[SegSpatialDetection]) -> None:
+    if not detections:
+        return
+
+    lines = ["coordinates"]
+    for index, detection in enumerate(detections, start=1):
+        if detection.xyz_mm is None:
+            lines.append(f"{index}: no cam position")
+        else:
+            x_mm, y_mm, z_mm = detection.xyz_mm
+            lines.append(f"{index} cam  x={x_mm:.0f} y={y_mm:.0f} z={z_mm:.0f} mm")
+
+        if detection.grid_xyz_mm is None:
+            lines.append("  grid no position")
+        else:
+            gx_mm, gy_mm, gz_mm = detection.grid_xyz_mm
+            lines.append(f"  grid x={gx_mm:.0f} y={gy_mm:.0f} z={gz_mm:.0f} mm")
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.55
+    thickness = 1
+    line_height = 22
+    padding = 10
+    text_sizes = [cv2.getTextSize(line, font, scale, thickness)[0] for line in lines]
+    width = min(frame.shape[1], max(size[0] for size in text_sizes) + padding * 2)
+    height = min(frame.shape[0] - 34, line_height * len(lines) + padding * 2)
+    x0, y0 = 0, 34
+
+    panel = frame.copy()
+    cv2.rectangle(panel, (x0, y0), (x0 + width, y0 + height), (12, 18, 22), -1)
+    cv2.addWeighted(panel, 0.78, frame, 0.22, 0, frame)
+    cv2.rectangle(frame, (x0, y0), (x0 + width, y0 + height), (55, 70, 78), 1)
+
+    for row, line in enumerate(lines):
+        color = (238, 243, 245) if row == 0 else (190, 245, 255)
+        cv2.putText(
+            frame,
+            line,
+            (x0 + padding, y0 + padding + 16 + line_height * row),
+            font,
+            scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
 def draw_detections(frame: np.ndarray, detections: list[SegSpatialDetection], show_boxes: bool) -> None:
     overlay = frame.copy()
     for index, detection in enumerate(detections, start=1):
@@ -737,27 +814,23 @@ def draw_detections(frame: np.ndarray, detections: list[SegSpatialDetection], sh
 
         if detection.polygon is not None:
             cv2.fillPoly(overlay, [detection.polygon], color)
+
+    if detections:
+        cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+
+    for index, detection in enumerate(detections, start=1):
+        color = (0, 255, 255) if detection.xyz_mm is not None else (0, 180, 255)
+        x0, y0, x1, y1 = detection.bbox
+
+        if detection.polygon is not None:
             cv2.polylines(frame, [detection.polygon], isClosed=True, color=color, thickness=2)
         if show_boxes:
             cv2.rectangle(frame, (x0, y0), (x1, y1), color, 1)
 
         cv2.circle(frame, detection.center, 4, (0, 0, 255), -1)
-        if detection.xyz_mm is None:
-            lines = [f"{index}: {detection.label} {detection.confidence:.2f} no position"]
-        else:
-            x_mm, y_mm, z_mm = detection.xyz_mm
-            lines = [
-                f"{index}: {detection.label} {detection.confidence:.2f} {detection.source} px={detection.support_pixels}",
-                f"cam  x={x_mm:.0f} y={y_mm:.0f} z={z_mm:.0f} mm",
-            ]
-            if detection.grid_xyz_mm is not None:
-                gx_mm, gy_mm, gz_mm = detection.grid_xyz_mm
-                lines.append(f"grid x={gx_mm:.0f} y={gy_mm:.0f} z={gz_mm:.0f} mm")
+        draw_number_marker(frame, detection.center, index)
 
-        draw_label_box(frame, (x0, max(20, y0 - 8)), lines, color)
-
-    if detections:
-        cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+    draw_coordinate_list(frame, detections)
 
 
 def draw_header(frame: np.ndarray, text: str) -> None:

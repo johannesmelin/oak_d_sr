@@ -7,6 +7,11 @@ __pycache__/
 .ruff_cache/
 captures/
 datasets/
+segmentation_dataset/
+yolo_seg_dataset/
+yolo_preview/
+training_runs/
 runs/
+*.pt
 *.log
 *~

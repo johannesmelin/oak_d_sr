@@ -7,6 +7,15 @@ OAK-D SR ar en kortdistans-stereokamera med tva OV9782 global-shutter-sensorer
 pa upp till `1280x800`. Den har kort stereobaslinje, cirka `20 mm`, och ar
 tankt for kortare arbetsavstand.
 
+Aktuell version ar byggd specifikt for OAK-D SR och gor:
+
+- YOLO-segmentering av knoppar i `CAM_B`-bilden.
+- stereo-depth med `CAM_B` och `CAM_C`, depth alignad till `CAM_B`.
+- HSV-filtrerat depth-urval inne i segmenteringsmasken.
+- position i bade kamerakoordinater, `cam x,y,z`, och kalibrerade
+  arbetskoordinater, `grid x,y,z`.
+- webbaserad kontrollbild med numrerade knoppar och en samlad koordinatlista.
+
 ## Installation
 
 ```bash
@@ -94,10 +103,17 @@ OAK-D SR har ingen separat `CAM_A`-RGB-kamera. Scriptet
 `CAM_B` som kamerabild, `CAM_C` som hoger stereokamera och alignar depth till
 `CAM_B`.
 
-Som standard laddas den senaste segmenteringsmodellen fran `oak_camera`:
+Som standard laddas en tidigare segmenteringsmodell fran `oak_camera`:
 
 ```text
 /home/johannes/projects/oak_camera/training_runs/knopp_yolo_seg_640_e30/weights/best.pt
+```
+
+Den aktuella OAK-D SR-versionen ar tranad pa bilder fran OAK-D SR i
+`1280x800` och anvands med modellen:
+
+```text
+training_runs/knopp_oakdsr_yolo_seg_960_e50/weights/best.pt
 ```
 
 Starta med full sensorupplosning, roterad bild och en webbild per sekund:
@@ -105,10 +121,16 @@ Starta med full sensorupplosning, roterad bild och en webbild per sekund:
 ```bash
 /home/johannes/projects/oak_camera/.venv/bin/python \
   scripts/oakdsr_yolo_seg_localizer.py --web-host 0.0.0.0 \
+  --model training_runs/knopp_oakdsr_yolo_seg_960_e50/weights/best.pt \
   --width 1280 --height 800 \
   --stereo-width 1280 --stereo-height 800 \
   --fps 2 --camera-rotation 180 \
-  --viewer-interval-ms 1000 --viewer-scale 0.75
+  --viewer-interval-ms 1000 --viewer-scale 1.0 \
+  --classes knopp --imgsz 960 \
+  --depth-mask hsv \
+  --hsv-low 62,35,35 --hsv-high 158,255,255 \
+  --hsv-open-kernel 0 --hsv-close-kernel 2 \
+  --show-boxes
 ```
 
 Forsta testet kors med `oak_camera/.venv` eftersom den redan har fungerande
@@ -142,15 +164,28 @@ Kalibreringstransformen ar:
 grid = R @ cam + t
 
 R =
-[[ 0.999385, -0.019590, -0.029071],
- [ 0.011272, -0.605663,  0.795641],
- [-0.033194, -0.795480, -0.605070]]
+[[ 0.999739296, -0.017369757,  0.014819986],
+ [-0.022243652, -0.594407549,  0.803856260],
+ [-0.005153677, -0.803976342, -0.594638951]]
 
-t = [15.726901, -7.512921, 311.320733]
+t = [10.975328, -4.674079, 317.735563]
 ```
 
-I webblasaren visas bade `cam` och `grid` vid varje detektion. Om bara
-kamerakoordinater ska visas kan grid-transformen stangas av med:
+Transformen ar anpassad till 45 uppmatta kalibreringspunkter for den aktuella
+OAK-D SR-uppstallningen. Anpassningsfelet blev:
+
+```text
+3D RMS-fel: cirka 6.1 mm
+Medelfel:  cirka 5.5 mm
+Maxfel:    cirka 12.6 mm
+```
+
+I webblasaren markeras varje knopp med ett nummer, `1`, `2`, `3` osv. I
+vansterkanten visas en samlad lista med bade `cam x,y,z` och `grid x,y,z` for
+respektive nummer. Detta gor att texten inte overlappar nar flera knoppar star
+nara varandra och gor det enklare att samla ny kalibreringsdata.
+
+Om bara kamerakoordinater ska visas kan grid-transformen stangas av med:
 
 ```bash
 --no-grid-transform
@@ -217,3 +252,108 @@ Viktiga parametrar:
   `1000`.
 - `--no-grid-transform`: visar bara `cam` och hoppar over kalibrerad
   `grid`-koordinat.
+
+## Ny segmenteringsdataset
+
+Nar en ny modell ska tranas samlas forst bilder med OAK-D SR och annoteras med
+polygonmasker i Label Studio.
+
+Stoppa forst eventuell korande localizer, eftersom bara en process kan aga
+kameran at gangen. Starta sedan capture-scriptet:
+
+```bash
+/home/johannes/projects/oak_camera/.venv/bin/python \
+  scripts/oakdsr_capture_segmentation_dataset.py --web-host 0.0.0.0 \
+  --class-name knopp --split train \
+  --width 1280 --height 800 --fps 2 --camera-rotation 180
+```
+
+Oppna:
+
+```text
+http://johannesmelin.local:8095
+```
+
+Terminalkommandon:
+
+- `c` + Enter: spara en bild.
+- `b` + Enter: spara en burst, standard 5 bilder.
+- `g` + Enter: spara bakgrundsbild utan objekt.
+- `q` + Enter: avsluta.
+
+Bilderna sparas i:
+
+```text
+segmentation_dataset/images/<split>/<klass>/
+```
+
+och metadata i:
+
+```text
+segmentation_dataset/metadata.csv
+```
+
+Ta en blandning av:
+
+- enskilda tydliga knoppar,
+- flera knoppar i samma bild,
+- delvis skymda knoppar,
+- nagra bilder utan knoppar.
+
+Vid skymning ska bara den synliga delen av varje knopp annoteras. Varje synlig
+knopp ska vara en egen polygoninstans.
+
+Skapa darefter Label Studio-importfil med inbaddade bilder:
+
+```bash
+/home/johannes/projects/oak_camera/.venv/bin/python \
+  scripts/create_label_studio_tasks.py --prepared-dir segmentation_dataset \
+  --output segmentation_dataset/label_studio_tasks_embedded.json --embed
+```
+
+Importera `segmentation_dataset/label_studio_tasks_embedded.json` i Label
+Studio. Labeling setup ska vara polygonbaserad:
+
+```xml
+<View>
+  <Image name="image" value="$image"/>
+  <PolygonLabels name="label" toName="image">
+    <Label value="knopp"/>
+  </PolygonLabels>
+</View>
+```
+
+Nar annoteringen ar klar exporteras Label Studio-projektet till YOLO
+segmentation-format:
+
+```bash
+/home/johannes/projects/oak_camera/.venv/bin/python \
+  scripts/export_yolo_seg_from_label_studio.py \
+  --prepared-dir segmentation_dataset \
+  --output-dir yolo_seg_dataset \
+  --project <projektnamn-eller-id> --overwrite
+```
+
+Kontrollera annoteringarna med en kontaktkarta:
+
+```bash
+/home/johannes/projects/oak_camera/.venv/bin/python \
+  scripts/preview_yolo_seg_dataset.py --data yolo_seg_dataset/data.yaml \
+  --split val --contact-sheet yolo_preview/val_seg_contact_sheet.jpg
+```
+
+Trana modellen:
+
+```bash
+/home/johannes/projects/oak_camera/.venv/bin/python \
+  scripts/train_yolo_seg.py --data yolo_seg_dataset/data.yaml \
+  --epochs 50 --imgsz 960 --batch 1 \
+  --name knopp_oakdsr_yolo_seg_960_e50
+```
+
+Senaste OAK-D SR-traningen anvande `43` bilder, polygonmasker fran Label
+Studio och gav modellen:
+
+```text
+training_runs/knopp_oakdsr_yolo_seg_960_e50/weights/best.pt
+```
